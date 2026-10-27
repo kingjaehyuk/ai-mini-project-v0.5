@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 
@@ -79,23 +80,28 @@ async def analyze_competitor(state: AgentState, competitor: str) -> dict:
     }
 
 
+async def run_branch(state: AgentState, competitor: str) -> dict:
+    """갈래 하나를 실행하고 시작/종료 이벤트와 소요 시간을 남깁니다."""
+    emit(BranchStart(node="competitor_analyst", branch=competitor))
+    started = time.perf_counter()
+
+    finding = await analyze_competitor(state, competitor)
+
+    elapsed = int((time.perf_counter() - started) * 1000)
+    emit(BranchEnd(node="competitor_analyst", branch=competitor, duration_ms=elapsed))
+    return finding
+
+
 @traced("competitor_analyst")
 async def competitor_analyst(state: AgentState) -> dict:
     competitors = state.get("competitors", [])
     emit(Progress(node="competitor_analyst", message=f"분석 대상 {len(competitors)}개 기업: {', '.join(competitors)}"))
 
-    update: dict = {}
-    for competitor in competitors:
-        emit(BranchStart(node="competitor_analyst", branch=competitor))
-        started = time.perf_counter()
+    # Fan-out: 기업별 갈래를 동시에 실행 / Fan-in: 모든 기업의 결과를 기업 순서대로 모음
+    findings = await asyncio.gather(*(run_branch(state, c) for c in competitors))
+    emit(Progress(node="competitor_analyst", message=f"기업별 분석 결과 {len(findings)}건 수집"))
 
-        finding = await analyze_competitor(state, competitor)
-        update["competitor_findings"] = [finding]      # 기업별 분석 결과 저장
-
-        elapsed = int((time.perf_counter() - started) * 1000)
-        emit(BranchEnd(node="competitor_analyst", branch=competitor, duration_ms=elapsed))
-
-    return update
+    return {"competitor_findings": list(findings)}
 
 
 # ──────────────────────────────────────────────────────────────

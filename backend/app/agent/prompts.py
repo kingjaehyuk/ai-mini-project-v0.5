@@ -57,4 +57,7 @@ def format_evidence(evidence: list[dict]) -> str:
 def format_findings(findings: list[dict]) -> str:
     if not findings:
         return "(경쟁사 분석 결과 없음)"
-    return "\n\n".join(f"### {f['competitor']}\n{f['analysis']}" for f in findings)
+    return "\n\n".join(
+        f"### {f['competitor']}\n{f['analysis']}\n출처: {', '.join(f.get('sources', [])) or '(없음)'}"
+        for f in findings
+    )
