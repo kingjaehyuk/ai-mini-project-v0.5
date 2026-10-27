@@ -33,3 +33,4 @@ class AgentState(TypedDict, total=False):
     eval_passed: bool
     eval_reason: str
     eval_attempts: int
+    status: str                 # "completed"(평가 통과) | "eval_failed"(재작성 예정) | "max_attempts"(재시도 상한 도달로 종료)

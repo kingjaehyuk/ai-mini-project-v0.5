@@ -8,18 +8,21 @@
 """
 from __future__ import annotations
 
+import json
 import time
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from app.agent.prompts import (
     COMPETITOR_ANALYST_SYSTEM,
+    EVALUATOR_SYSTEM,
     WRITER_SYSTEM,
     format_evidence,
     format_findings,
 )
 from app.agent.state import AgentState
 from app.agent.tracing import traced
+from app.config import settings
 from app.events import BranchEnd, BranchStart, Evaluation, Progress, Token, emit
 from app.llm import ainvoke_tracked, astream_tracked
 from app.retrieval import index_exists, search_docs, search_web, web_search_enabled
@@ -118,25 +121,45 @@ async def writer(state: AgentState) -> dict:
         emit(Token(node="writer", text=POOR_OUTPUT_SAMPLE))
         return {"draft": POOR_OUTPUT_SAMPLE}
 
-    messages = [
-        SystemMessage(content=WRITER_SYSTEM),
-        HumanMessage(content=(
-            f"사용자 질문: {state['query']}\n"
-            f"분석 아이템: {state['item_name']}\n"
-            f"분석 대상 기업: {', '.join(state.get('competitors', []))}\n\n"
-            f"근거 자료:\n{format_evidence(state.get('evidence', []))}\n\n"
-            f"경쟁사 분석 결과:\n{format_findings(state.get('competitor_findings', []))}"
-        )),
-    ]
+    content = (
+        f"사용자 질문: {state['query']}\n"
+        f"분석 아이템: {state['item_name']}\n"
+        f"분석 대상 기업: {', '.join(state.get('competitors', []))}\n\n"
+        f"근거 자료:\n{format_evidence(state.get('evidence', []))}\n\n"
+        f"경쟁사 분석 결과:\n{format_findings(state.get('competitor_findings', []))}"
+    )
+    # 재작성: 이전 평가의 실패 사유와 개선 요구를 반영합니다.
+    if state.get("status") == "eval_failed" and state.get("eval_reason"):
+        emit(Progress(node="writer", message="이전 평가 피드백을 반영해 다시 작성합니다."))
+        content += f"\n\n이전 보고서 평가 피드백 (반드시 반영):\n{state['eval_reason']}"
+
+    messages = [SystemMessage(content=WRITER_SYSTEM), HumanMessage(content=content)]
     draft = await astream_tracked(messages, node="writer")
     return {"draft": draft}
 
 
 # ──────────────────────────────────────────────────────────────
 # step_evaluator : 보고서 평가
-#  - 통과하면 종료, 통과하지 못하면 writer 가 다시 작성합니다.
+#  - 분량을 먼저 확인하고, 질문 충족·근거 일치·근거 없는 추정을 LLM으로 평가합니다.
+#  - 통과하면 종료, 통과하지 못하면 피드백과 함께 writer 가 다시 작성합니다.
+#  - 평가 횟수가 상한(settings.max_eval_attempts)에 도달하면 실패 사유를 남기고 종료합니다.
 # ──────────────────────────────────────────────────────────────
 MIN_REPORT_CHARS = 300
+
+
+def parse_evaluation(text: str) -> tuple[bool, str]:
+    """평가 LLM 응답(JSON)을 (통과 여부, 사유+개선 요구)로 바꿉니다. 해석할 수 없으면 실패로 봅니다."""
+    raw = text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    try:
+        result = json.loads(raw)
+    except json.JSONDecodeError:
+        return False, "평가 결과를 해석하지 못했습니다. 근거 [n]를 붙여 질문에 직접 답하도록 다시 작성하세요."
+    passed = result.get("passed") is True
+    reason = str(result.get("reason", "")).strip()
+    feedback = str(result.get("feedback", "")).strip()
+    if not passed and feedback:
+        reason = f"{reason} / 개선 요구: {feedback}"
+    return passed, reason
 
 
 @traced("step_evaluator")
@@ -144,12 +167,35 @@ async def step_evaluator(state: AgentState) -> dict:
     draft = state.get("draft", "")
     attempt = state.get("eval_attempts", 0) + 1
 
-    passed = len(draft.strip()) >= MIN_REPORT_CHARS
-    reason = "보고서 분량 충족" if passed else f"보고서 분량 부족 ({len(draft.strip())}자)"
+    if len(draft.strip()) < MIN_REPORT_CHARS:
+        passed, reason = False, f"보고서 분량 부족 ({len(draft.strip())}자) / 개선 요구: {MIN_REPORT_CHARS}자 이상으로 작성하세요."
+    else:
+        messages = [
+            SystemMessage(content=EVALUATOR_SYSTEM),
+            HumanMessage(content=(
+                f"사용자 질문: {state['query']}\n\n"
+                f"근거 자료:\n{format_evidence(state.get('evidence', []))}\n\n"
+                f"경쟁사 분석 결과:\n{format_findings(state.get('competitor_findings', []))}\n\n"
+                f"평가할 보고서:\n{draft}"
+            )),
+        ]
+        passed, reason = parse_evaluation(await ainvoke_tracked(messages, node="step_evaluator"))
 
     emit(Evaluation(stage="report", passed=passed, reason=reason, attempt=attempt))
-    return {"eval_passed": passed, "eval_reason": reason, "eval_attempts": attempt}
+
+    if passed:
+        status = "completed"
+    elif attempt >= settings.max_eval_attempts:
+        status = "max_attempts"
+        emit(Progress(
+            node="step_evaluator",
+            message=f"재시도 상한({settings.max_eval_attempts}회) 도달로 평가 미통과 상태로 종료합니다. 사유: {reason}",
+        ))
+    else:
+        status = "eval_failed"
+
+    return {"eval_passed": passed, "eval_reason": reason, "eval_attempts": attempt, "status": status}
 
 
 def route_after_evaluation(state: AgentState) -> str:
-    return "end" if state.get("eval_passed") else "writer"
+    return "writer" if state.get("status") == "eval_failed" else "end"
