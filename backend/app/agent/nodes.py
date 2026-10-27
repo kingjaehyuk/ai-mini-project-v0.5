@@ -28,7 +28,7 @@ from app.agent.state import AgentState
 from app.agent.tracing import traced
 from app.config import settings
 from app.events import BranchEnd, BranchStart, Evaluation, Progress, Token, emit
-from app.llm import ainvoke_tracked, astream_tracked
+from app.llm import BudgetExceeded, ainvoke_tracked, astream_tracked, budget_exceeded
 from app.retrieval import index_exists, search_docs, search_web, web_search_enabled
 
 
@@ -68,7 +68,11 @@ async def researcher(state: AgentState) -> dict:
             f"근거 자료:\n{format_evidence(evidence)}"
         )),
     ]
-    result = parse_json(await ainvoke_tracked(messages, node="researcher")) or {}
+    try:
+        result = parse_json(await ainvoke_tracked(messages, node="researcher")) or {}
+    except BudgetExceeded as e:
+        emit(Progress(node="researcher", message=f"[비용 상한] 근거 충족 판단 생략: {e}"))
+        result = {"reason": "비용 상한 도달로 근거 충족 여부를 판단하지 못함"}
     sufficient = result.get("sufficient") is True
     note = str(result.get("reason", "")).strip() or "근거 충족 여부를 판단하지 못함"
     emit(Progress(node="researcher", message=f"근거 {'충분' if sufficient else '부족'}: {note}"))
@@ -103,7 +107,11 @@ async def analyze_competitor(state: AgentState, competitor: str) -> dict:
             f"근거 자료:\n{format_evidence(evidence)}"
         )),
     ]
-    analysis = await ainvoke_tracked(messages, node="competitor_analyst")
+    try:
+        analysis = await ainvoke_tracked(messages, node="competitor_analyst")
+    except BudgetExceeded as e:
+        emit(Progress(node="competitor_analyst", message=f"[비용 상한] {competitor} 분석 생략: {e}"))
+        analysis = "근거 부족: 비용 상한 도달로 분석하지 못함"
     return {
         "competitor": competitor,
         "analysis": analysis,
@@ -175,8 +183,30 @@ async def writer(state: AgentState) -> dict:
 
     system = WRITER_SYSTEM_BY_INTENT.get(state.get("intent", ""), WRITER_SYSTEM)
     messages = [SystemMessage(content=system), HumanMessage(content=content)]
-    draft = await astream_tracked(messages, node="writer")
+    try:
+        draft = await astream_tracked(messages, node="writer")
+    except BudgetExceeded as e:
+        # 비용 상한: 이전 보고서가 있으면 그대로 두고, 없으면 수집한 근거 목록으로 최소 보고서를 만듭니다.
+        if state.get("draft"):
+            emit(Progress(node="writer", message=f"[비용 상한] 재작성 생략, 이전 보고서를 유지합니다: {e}"))
+            return {}
+        emit(Progress(node="writer", message=f"[비용 상한] 보고서 작성 생략, 수집한 근거 목록으로 대신합니다: {e}"))
+        draft = budget_fallback_report(state)
+        emit(Token(node="writer", text=draft))
     return {"draft": draft}
+
+
+def budget_fallback_report(state: AgentState) -> str:
+    """비용 상한으로 LLM 보고서를 만들지 못했을 때 내보내는 최소 보고서"""
+    sources = "\n".join(
+        f"- [{i}] {e['title']} | {e['source']}" for i, e in enumerate(state.get("evidence", []), start=1)
+    ) or "- (수집한 근거 없음)"
+    return (
+        f"# {state['query']}\n\n"
+        "## 비용 상한 도달\n"
+        f"실행 1회의 LLM 비용 상한(${settings.cost_limit_usd})에 도달해 보고서를 작성하지 못했습니다.\n\n"
+        f"## 수집한 근거 자료\n{sources}\n"
+    )
 
 
 # ──────────────────────────────────────────────────────────────
@@ -208,6 +238,13 @@ async def step_evaluator(state: AgentState) -> dict:
     draft = state.get("draft", "")
     attempt = state.get("eval_attempts", 0) + 1
 
+    # 비용 상한: 이미 상한에 도달했거나 평가 호출을 예약할 수 없으면 평가를 생략하고 현재 보고서로 종료합니다.
+    budget_end = {"eval_passed": False, "status": "budget_exceeded",
+                  "eval_reason": "비용 상한 도달로 평가를 생략했습니다."}
+    if budget_exceeded():
+        emit(Progress(node="step_evaluator", message="[비용 상한] 평가를 생략하고 현재 보고서로 종료합니다."))
+        return budget_end
+
     if len(draft.strip()) < MIN_REPORT_CHARS:
         passed, reason = False, f"보고서 분량 부족 ({len(draft.strip())}자) / 개선 요구: {MIN_REPORT_CHARS}자 이상으로 작성하세요."
     else:
@@ -220,7 +257,11 @@ async def step_evaluator(state: AgentState) -> dict:
                 f"평가할 보고서:\n{draft}"
             )),
         ]
-        passed, reason = parse_evaluation(await ainvoke_tracked(messages, node="step_evaluator"))
+        try:
+            passed, reason = parse_evaluation(await ainvoke_tracked(messages, node="step_evaluator"))
+        except BudgetExceeded as e:
+            emit(Progress(node="step_evaluator", message=f"[비용 상한] 평가를 생략하고 현재 보고서로 종료합니다: {e}"))
+            return budget_end
 
     emit(Evaluation(stage="report", passed=passed, reason=reason, attempt=attempt))
 

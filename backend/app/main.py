@@ -23,7 +23,8 @@ from pydantic import BaseModel
 
 from app.agent.graph import graph
 from app.config import get_item, load_items, settings
-from app.events import Done, ErrorEvent, Report, RunStart
+from app.events import Done, ErrorEvent, Progress, Report, RunStart
+from app.llm import Budget
 
 app = FastAPI(title="AI Service Mini Project")
 app.add_middleware(
@@ -82,11 +83,13 @@ async def chat(req: ChatRequest):
         started = time.perf_counter()
         totals = {"llm_calls": 0, "input_tokens": 0, "output_tokens": 0, "total_cost_usd": 0.0}
         final_draft = ""
+        budget = Budget(limit_usd=settings.cost_limit_usd)   # 이 실행의 모든 노드가 함께 쓰는 비용 예산
 
         yield to_sse(RunStart(
             run_id=run_id, item_id=req.item_id, item_name=item["name"],
             competitors=item["competitors"], query=req.query, test_mode=test_mode,
         ).model_dump())
+        yield to_sse(Progress(node="budget", message=f"LLM 비용 상한: ${settings.cost_limit_usd} (실행 1회)").model_dump())
 
         try:
             # stream_mode="values" : 각 단계가 끝난 뒤의 상태 전체
@@ -94,7 +97,7 @@ async def chat(req: ChatRequest):
             async for mode, payload in graph.astream(
                 initial_state,
                 stream_mode=["custom", "values"],
-                config={"recursion_limit": settings.recursion_limit},
+                config={"recursion_limit": settings.recursion_limit, "configurable": {"budget": budget}},
             ):
                 if mode == "values":
                     final_draft = payload.get("draft", final_draft)

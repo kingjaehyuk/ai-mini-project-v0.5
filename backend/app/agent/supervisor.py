@@ -15,6 +15,7 @@ Supervisor
   3. 근거가 부족하면 재검색 (재검색 상한, 웹 검색 가능 여부 확인) / 더 할 수 없으면 한계를 남기고 진행
   4. 경쟁사 비교 질문이면 competitor_analyst
   5. writer
+  비용 상한에 도달하면 재검색·경쟁사 분석을 생략하고 writer 로 갑니다.
 """
 from __future__ import annotations
 
@@ -25,7 +26,7 @@ from app.agent.state import AgentState
 from app.agent.tracing import traced
 from app.config import settings
 from app.events import Progress, Route, emit
-from app.llm import ainvoke_tracked
+from app.llm import BudgetExceeded, ainvoke_tracked, budget_exceeded
 from app.retrieval import web_search_enabled
 
 WORKERS = ["researcher", "competitor_analyst", "writer"]
@@ -36,7 +37,12 @@ INTENT_LABELS = {"fact": "단일 사실 확인", "compare": "경쟁사 비교", 
 async def classify_intent(state: AgentState) -> str:
     """질문 의도를 LLM으로 분류합니다. 해석할 수 없으면 전체 작업을 수행하는 compare 로 봅니다."""
     messages = [SystemMessage(content=INTENT_SYSTEM), HumanMessage(content=f"질문: {state['query']}")]
-    result = parse_json(await ainvoke_tracked(messages, node="supervisor")) or {}
+    try:
+        result = parse_json(await ainvoke_tracked(messages, node="supervisor")) or {}
+    except BudgetExceeded as e:
+        # 비용 상한: 경쟁사 분석이 없는 가장 짧은 경로로 진행합니다.
+        emit(Progress(node="supervisor", message=f"[비용 상한] 질문 의도 분류 생략, 단일 사실 확인 경로로 진행합니다: {e}"))
+        return "fact"
     intent = result.get("intent")
     if intent not in INTENTS:
         emit(Progress(node="supervisor", message="질문 의도를 해석하지 못해 경쟁사 비교 경로로 진행합니다."))
@@ -50,6 +56,10 @@ def decide_next(state: AgentState, intent: str) -> tuple[str, str, dict]:
     attempts = state.get("search_attempts", 0)
     if attempts == 0:
         return "researcher", "근거 자료가 아직 없음", {}
+
+    # 비용 상한 도달: 재검색·경쟁사 분석을 생략하고 지금까지의 근거로 작성합니다.
+    if budget_exceeded():
+        return "writer", "비용 상한 도달로 남은 작업(재검색·경쟁사 분석)을 생략하고 작성", {}
 
     if not state.get("evidence_sufficient", False):
         note = state.get("evidence_note", "")
