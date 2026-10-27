@@ -20,12 +20,15 @@ class AgentState(TypedDict, total=False):
     test_mode: bool             # 점검용 테스트 모드 (True면 writer가 부실한 결과를 만듦)
 
     # ── Supervisor ──────────────────────
-    plan: list[str]             # 실행할 작업 목록
-    plan_index: int             # 지금까지 진행한 작업 수
+    intent: str                 # 질문 의도: "fact"(단일 사실) | "compare"(경쟁사 비교) | "latest"(최신 정보)
     next: str                   # 다음에 실행할 노드 이름
 
     # ── 작업 결과 ────────────────────────
     evidence: list[dict]                # researcher 가 모은 근거 자료
+    search_query: str                   # 다음 검색에 쓸 쿼리 (재검색 시 보완된 쿼리)
+    search_attempts: int                # 검색 실행 횟수 (재검색 상한 판단용)
+    evidence_sufficient: bool           # 근거가 질문에 답하기에 충분한지
+    evidence_note: str                  # 근거 판단 사유 / 근거 한계 (writer 에 전달)
     competitor_findings: list[dict]     # competitor_analyst 의 경쟁사별 분석 결과
     draft: str                          # writer 가 작성한 보고서 초안
 

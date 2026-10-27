@@ -17,9 +17,12 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from app.agent.prompts import (
     COMPETITOR_ANALYST_SYSTEM,
     EVALUATOR_SYSTEM,
+    SUFFICIENCY_SYSTEM,
     WRITER_SYSTEM,
+    WRITER_SYSTEM_BY_INTENT,
     format_evidence,
     format_findings,
+    parse_json,
 )
 from app.agent.state import AgentState
 from app.agent.tracing import traced
@@ -31,10 +34,16 @@ from app.retrieval import index_exists, search_docs, search_web, web_search_enab
 
 # ──────────────────────────────────────────────────────────────
 # researcher : 근거 자료 수집
+#  - 재검색이면 보완된 쿼리(search_query)로 찾고, 기존 근거에 중복 없이 더합니다.
+#  - 수집 후 근거가 질문에 답하기에 충분한지 LLM으로 판단해 Supervisor 에 넘깁니다.
 # ──────────────────────────────────────────────────────────────
 @traced("researcher")
 async def researcher(state: AgentState) -> dict:
-    item_id, query = state["item_id"], state["query"]
+    item_id = state["item_id"]
+    query = state.get("search_query") or state["query"]
+    attempt = state.get("search_attempts", 0) + 1
+    if attempt > 1:
+        emit(Progress(node="researcher", message=f"보완 쿼리로 재검색: {query}"))
 
     if not index_exists(item_id):
         emit(Progress(node="researcher", message=f"'{item_id}' 문서 인덱스가 없습니다. scripts/ingest.py 를 먼저 실행하세요."))
@@ -48,7 +57,29 @@ async def researcher(state: AgentState) -> dict:
     else:
         emit(Progress(node="researcher", message="TAVILY_API_KEY 가 없어 웹 검색을 건너뜁니다."))
 
-    return {"evidence": docs + web}
+    evidence = list(state.get("evidence", []))
+    seen = {(e["source"], e["content"]) for e in evidence}
+    evidence += [e for e in docs + web if (e["source"], e["content"]) not in seen]
+
+    messages = [
+        SystemMessage(content=SUFFICIENCY_SYSTEM),
+        HumanMessage(content=(
+            f"사용자 질문: {state['query']}\n질문 의도: {state.get('intent', '')}\n\n"
+            f"근거 자료:\n{format_evidence(evidence)}"
+        )),
+    ]
+    result = parse_json(await ainvoke_tracked(messages, node="researcher")) or {}
+    sufficient = result.get("sufficient") is True
+    note = str(result.get("reason", "")).strip() or "근거 충족 여부를 판단하지 못함"
+    emit(Progress(node="researcher", message=f"근거 {'충분' if sufficient else '부족'}: {note}"))
+
+    return {
+        "evidence": evidence,
+        "search_attempts": attempt,
+        "search_query": str(result.get("next_query", "")).strip() or query,
+        "evidence_sufficient": sufficient,
+        "evidence_note": note,
+    }
 
 
 # ──────────────────────────────────────────────────────────────
@@ -134,12 +165,16 @@ async def writer(state: AgentState) -> dict:
         f"근거 자료:\n{format_evidence(state.get('evidence', []))}\n\n"
         f"경쟁사 분석 결과:\n{format_findings(state.get('competitor_findings', []))}"
     )
+    # 근거가 부족한 채로 진행하는 경우, 그 한계를 보고서에 밝히도록 전달합니다.
+    if not state.get("evidence_sufficient", True) and state.get("evidence_note"):
+        content += f"\n\n근거 한계 (보고서의 한계와 불확실성에 반드시 명시):\n{state['evidence_note']}"
     # 재작성: 이전 평가의 실패 사유와 개선 요구를 반영합니다.
     if state.get("status") == "eval_failed" and state.get("eval_reason"):
         emit(Progress(node="writer", message="이전 평가 피드백을 반영해 다시 작성합니다."))
         content += f"\n\n이전 보고서 평가 피드백 (반드시 반영):\n{state['eval_reason']}"
 
-    messages = [SystemMessage(content=WRITER_SYSTEM), HumanMessage(content=content)]
+    system = WRITER_SYSTEM_BY_INTENT.get(state.get("intent", ""), WRITER_SYSTEM)
+    messages = [SystemMessage(content=system), HumanMessage(content=content)]
     draft = await astream_tracked(messages, node="writer")
     return {"draft": draft}
 
