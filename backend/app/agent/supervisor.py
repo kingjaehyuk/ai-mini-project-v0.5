@@ -12,7 +12,8 @@ Supervisor
 판단 순서
   1. 질문 의도 분류 (최초 1회, LLM)   fact | compare | latest
   2. 근거가 없으면 researcher
-  3. 근거가 부족하면 재검색 (재검색 상한, 웹 검색 가능 여부 확인) / 더 할 수 없으면 한계를 남기고 진행
+  3. 근거 수집 평가(researcher 의 check_research)가 미통과면 재검색 (재검색 상한, 웹 검색 가능 여부 확인)
+     / 더 할 수 없으면 한계를 남기고 진행
   4. 경쟁사 비교 질문이면 competitor_analyst
   5. writer
   비용 상한에 도달하면 재검색·경쟁사 분석을 생략하고 writer 로 갑니다.
@@ -69,9 +70,9 @@ def decide_next(state: AgentState, intent: str) -> tuple[str, str, dict]:
                 emit(Progress(node="supervisor", message=f"재검색 생략: {limit}"))
                 return _after_research(state, intent, {"evidence_note": f"{note} / 근거 한계: {limit}".strip(" /")})
         elif attempts < settings.max_search_attempts:
-            return "researcher", f"근거 부족으로 재검색 ({attempts + 1}/{settings.max_search_attempts}회): {note}", {}
+            return "researcher", f"근거 수집 평가 미통과로 재검색 ({attempts + 1}/{settings.max_search_attempts}회): {note}", {}
         else:
-            limit = f"재검색 상한({settings.max_search_attempts}회) 후에도 근거 부족"
+            limit = f"재검색 상한({settings.max_search_attempts}회) 후에도 근거 수집 평가 미통과"
             if limit not in note:
                 emit(Progress(node="supervisor", message=f"재검색 종료: {limit}"))
                 return _after_research(state, intent, {"evidence_note": f"{note} / 근거 한계: {limit}".strip(" /")})

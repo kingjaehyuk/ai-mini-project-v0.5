@@ -27,8 +27,8 @@ class AgentState(TypedDict, total=False):
     evidence: list[dict]                # researcher 가 모은 근거 자료
     search_query: str                   # 다음 검색에 쓸 쿼리 (재검색 시 보완된 쿼리)
     search_attempts: int                # 검색 실행 횟수 (재검색 상한 판단용)
-    evidence_sufficient: bool           # 근거가 질문에 답하기에 충분한지
-    evidence_note: str                  # 근거 판단 사유 / 근거 한계 (writer 에 전달)
+    evidence_sufficient: bool           # 근거 수집 단계 평가 통과 여부 (check_research)
+    evidence_note: str                  # 근거 수집 평가 사유 (다음 재검색 입력) / 근거 한계 (writer 에 전달)
     competitor_findings: list[dict]     # competitor_analyst 의 경쟁사별 분석 결과
     draft: str                          # writer 가 작성한 보고서 초안
 

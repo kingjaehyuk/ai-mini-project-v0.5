@@ -35,15 +35,36 @@ from app.retrieval import index_exists, search_docs, search_web, web_search_enab
 # ──────────────────────────────────────────────────────────────
 # researcher : 근거 자료 수집
 #  - 재검색이면 보완된 쿼리(search_query)로 찾고, 기존 근거에 중복 없이 더합니다.
-#  - 수집 후 근거가 질문에 답하기에 충분한지 LLM으로 판단해 Supervisor 에 넘깁니다.
+#  - 수집 후 근거가 질문에 답하기에 충분한지 LLM으로 판단합니다.
+#  - 근거 수집 단계 평가(check_research) 결과를 evaluation 이벤트로 남기고 Supervisor 에 넘깁니다.
+#    미통과면 Supervisor 가 재검색하며, 미통과 사유는 다음 시도의 근거 판단 입력에 들어갑니다.
 # ──────────────────────────────────────────────────────────────
+MIN_EVIDENCE = 3
+
+
+def check_research(evidence: list[dict], sufficient: bool, note: str) -> tuple[bool, str]:
+    """근거 수집 단계 통과 기준: 근거 MIN_EVIDENCE건 이상, 모든 근거에 출처, LLM 근거 충족 판단 "충분" """
+    problems = []
+    if len(evidence) < MIN_EVIDENCE:
+        problems.append(f"근거 {len(evidence)}건 ({MIN_EVIDENCE}건 미만)")
+    no_source = sum(1 for e in evidence if not str(e.get("source", "")).strip())
+    if no_source:
+        problems.append(f"출처 없는 근거 {no_source}건")
+    if not sufficient:
+        problems.append(f"근거 부족: {note}")
+    if problems:
+        return False, " / ".join(problems)
+    return True, f"근거 {len(evidence)}건, 모두 출처 있음, 근거 충분: {note}"
+
+
 @traced("researcher")
 async def researcher(state: AgentState) -> dict:
     item_id = state["item_id"]
     query = state.get("search_query") or state["query"]
     attempt = state.get("search_attempts", 0) + 1
+    previous_reason = state.get("evidence_note", "") if attempt > 1 else ""
     if attempt > 1:
-        emit(Progress(node="researcher", message=f"보완 쿼리로 재검색: {query}"))
+        emit(Progress(node="researcher", message=f"보완 쿼리로 재검색: {query} (직전 평가 사유 반영: {previous_reason})"))
 
     if not index_exists(item_id):
         emit(Progress(node="researcher", message=f"'{item_id}' 문서 인덱스가 없습니다. scripts/ingest.py 를 먼저 실행하세요."))
@@ -61,13 +82,20 @@ async def researcher(state: AgentState) -> dict:
     seen = {(e["source"], e["content"]) for e in evidence}
     evidence += [e for e in docs + web if (e["source"], e["content"]) not in seen]
 
-    messages = [
-        SystemMessage(content=SUFFICIENCY_SYSTEM),
-        HumanMessage(content=(
-            f"사용자 질문: {state['query']}\n질문 의도: {state.get('intent', '')}\n\n"
-            f"근거 자료:\n{format_evidence(evidence)}"
-        )),
-    ]
+    # 점검용 테스트 모드: 출처 없는 근거 1건만 남긴 "부실한 결과"를 만듭니다.
+    if state.get("test_mode"):
+        emit(Progress(node="researcher", message="[테스트 모드] 출처 없는 근거 1건만 남깁니다."))
+        sample = (docs + web)[:1] or [{"kind": "doc", "title": "(테스트)", "content": "근거 내용 없음"}]
+        evidence = [{**sample[0], "source": ""}]
+
+    content = (
+        f"사용자 질문: {state['query']}\n질문 의도: {state.get('intent', '')}\n\n"
+        f"근거 자료:\n{format_evidence(evidence)}"
+    )
+    # 재검색: 직전 평가의 미통과 사유를 근거 판단과 보완 쿼리 작성에 반영합니다.
+    if previous_reason:
+        content += f"\n\n직전 근거 수집 평가 미통과 사유 (해결됐는지 확인하고, 남은 부족을 보완 쿼리에 반영):\n{previous_reason}"
+    messages = [SystemMessage(content=SUFFICIENCY_SYSTEM), HumanMessage(content=content)]
     try:
         result = parse_json(await ainvoke_tracked(messages, node="researcher")) or {}
     except BudgetExceeded as e:
@@ -75,14 +103,16 @@ async def researcher(state: AgentState) -> dict:
         result = {"reason": "비용 상한 도달로 근거 충족 여부를 판단하지 못함"}
     sufficient = result.get("sufficient") is True
     note = str(result.get("reason", "")).strip() or "근거 충족 여부를 판단하지 못함"
-    emit(Progress(node="researcher", message=f"근거 {'충분' if sufficient else '부족'}: {note}"))
+
+    passed, reason = check_research(evidence, sufficient, note)
+    emit(Evaluation(stage="researcher", passed=passed, reason=reason, attempt=attempt))
 
     return {
         "evidence": evidence,
         "search_attempts": attempt,
         "search_query": str(result.get("next_query", "")).strip() or query,
-        "evidence_sufficient": sufficient,
-        "evidence_note": note,
+        "evidence_sufficient": passed,
+        "evidence_note": reason,
     }
 
 
