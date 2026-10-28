@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from difflib import SequenceMatcher
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -35,21 +36,27 @@ from app.retrieval import index_exists, search_docs, search_web, web_search_enab
 # ──────────────────────────────────────────────────────────────
 # researcher : 근거 자료 수집
 #  - 재검색이면 보완된 쿼리(search_query)로 찾고, 기존 근거에 중복 없이 더합니다.
-#  - 수집 후 근거가 질문에 답하기에 충분한지 LLM으로 판단합니다.
+#  - 수집 후 근거가 질문에 답하기에 충분한지 LLM으로 판단합니다. (경쟁사 비교 질문은 코드 기준만 사용)
 #  - 근거 수집 단계 평가(check_research) 결과를 evaluation 이벤트로 남기고 Supervisor 에 넘깁니다.
 #    미통과면 Supervisor 가 재검색하며, 미통과 사유는 다음 시도의 근거 판단 입력에 들어갑니다.
 # ──────────────────────────────────────────────────────────────
 MIN_EVIDENCE = 3
 
 
-def check_research(evidence: list[dict], sufficient: bool, note: str) -> tuple[bool, str]:
-    """근거 수집 단계 통과 기준: 근거 MIN_EVIDENCE건 이상, 모든 근거에 출처, LLM 근거 충족 판단 "충분" """
+def check_evidence_rules(evidence: list[dict]) -> list[str]:
+    """근거 수집 단계의 코드 기준: 근거 MIN_EVIDENCE건 이상, 모든 근거에 출처 (미통과 사유 목록, 없으면 빈 목록)"""
     problems = []
     if len(evidence) < MIN_EVIDENCE:
         problems.append(f"근거 {len(evidence)}건 ({MIN_EVIDENCE}건 미만)")
     no_source = sum(1 for e in evidence if not str(e.get("source", "")).strip())
     if no_source:
         problems.append(f"출처 없는 근거 {no_source}건")
+    return problems
+
+
+def check_research(evidence: list[dict], sufficient: bool, note: str) -> tuple[bool, str]:
+    """근거 수집 단계 통과 기준: 코드 기준(check_evidence_rules) + LLM 근거 충족 판단 "충분" """
+    problems = check_evidence_rules(evidence)
     if not sufficient:
         problems.append(f"근거 부족: {note}")
     if problems:
@@ -89,28 +96,44 @@ async def researcher(state: AgentState) -> dict:
         evidence = [{**sample[0], "source": ""}]
 
     content = (
-        f"사용자 질문: {state['query']}\n질문 의도: {state.get('intent', '')}\n\n"
+        f"사용자 질문: {state['query']}\n질문 의도: {state.get('intent', '')}\n"
+        f"이번 검색 쿼리: {query}\n\n"
         f"근거 자료:\n{format_evidence(evidence)}"
     )
+    # 코드 기준 미통과(근거 수·출처)를 알려, 그 부족을 메울 보완 쿼리를 만들게 합니다.
+    rule_problems = check_evidence_rules(evidence)
+    if rule_problems:
+        content += f"\n\n코드 기준 미통과 (보완 쿼리 필수): {' / '.join(rule_problems)}"
     # 재검색: 직전 평가의 미통과 사유를 근거 판단과 보완 쿼리 작성에 반영합니다.
     if previous_reason:
         content += f"\n\n직전 근거 수집 평가 미통과 사유 (해결됐는지 확인하고, 남은 부족을 보완 쿼리에 반영):\n{previous_reason}"
-    messages = [SystemMessage(content=SUFFICIENCY_SYSTEM), HumanMessage(content=content)]
-    try:
-        result = parse_json(await ainvoke_tracked(messages, node="researcher")) or {}
-    except BudgetExceeded as e:
-        emit(Progress(node="researcher", message=f"[비용 상한] 근거 충족 판단 생략: {e}"))
-        result = {"reason": "비용 상한 도달로 근거 충족 여부를 판단하지 못함"}
-    sufficient = result.get("sufficient") is True
+    # 경쟁사 비교(compare): 기업별 근거는 기업별 분석에서 따로 모으므로 코드 기준만으로 판정합니다.
+    # LLM은 코드 기준 미통과일 때 보완 쿼리를 만드는 데만 씁니다.
+    compare = state.get("intent") == "compare"
+    if compare and not rule_problems:
+        result = {"reason": "공통 배경 근거 확보 (기업별 근거는 기업별 분석에서 수집)"}
+    else:
+        messages = [SystemMessage(content=SUFFICIENCY_SYSTEM), HumanMessage(content=content)]
+        try:
+            result = parse_json(await ainvoke_tracked(messages, node="researcher")) or {}
+        except BudgetExceeded as e:
+            emit(Progress(node="researcher", message=f"[비용 상한] 근거 충족 판단 생략: {e}"))
+            result = {"reason": "비용 상한 도달로 근거 충족 여부를 판단하지 못함"}
+    sufficient = compare or result.get("sufficient") is True
     note = str(result.get("reason", "")).strip() or "근거 충족 여부를 판단하지 못함"
 
     passed, reason = check_research(evidence, sufficient, note)
     emit(Evaluation(stage="researcher", passed=passed, reason=reason, attempt=attempt))
 
+    next_query = str(result.get("next_query", "")).strip()
+    # 재검색이 이어지는 경우에만 (재검색 상한 전, 비용 상한 미도달) 같은 쿼리 사용을 알립니다.
+    if not passed and next_query in ("", query) and attempt < settings.max_search_attempts and not budget_exceeded():
+        emit(Progress(node="researcher", message="보완 쿼리를 만들지 못해 재검색 시 같은 쿼리를 사용합니다."))
+
     return {
         "evidence": evidence,
         "search_attempts": attempt,
-        "search_query": str(result.get("next_query", "")).strip() or query,
+        "search_query": next_query or query,
         "evidence_sufficient": passed,
         "evidence_note": reason,
     }
@@ -120,6 +143,8 @@ async def researcher(state: AgentState) -> dict:
 # competitor_analyst : 분석 대상 기업별 현황 분석
 #  - 기업마다 근거를 추가로 찾고, LLM으로 현황과 TRL을 추정합니다.
 #  - 기업 하나의 분석을 "갈래(branch)"라고 부르며, 갈래마다 시작/종료 이벤트를 남깁니다.
+#  - 기업별로 찾은 근거는 공유 근거 목록(evidence)에 중복 없이 합치고,
+#    분석 결과의 근거 번호 [n]을 공유 목록 번호로 바꿉니다. (writer 와 보고서 평가가 같은 번호를 보도록)
 #  - 기업별 분석 단계 평가(check_analysis) 결과를 evaluation 이벤트로 남기고 Supervisor 에 넘깁니다.
 #    미통과면 Supervisor 가 재분석하며, 미통과 기업만 그 사유를 입력에 넣어 다시 분석합니다.
 # ──────────────────────────────────────────────────────────────
@@ -130,7 +155,8 @@ POOR_ANALYSIS_SAMPLE = (
 
 
 async def analyze_competitor(state: AgentState, competitor: str, feedback: str = "") -> dict:
-    """기업 하나를 분석해 {"competitor": 기업명, "analysis": 분석 내용, "sources": [...]} 를 돌려줍니다."""
+    """기업 하나를 분석해 {"competitor": 기업명, "analysis": 분석 내용, "sources": [...], "evidence": [...]} 를 돌려줍니다.
+    analysis 의 근거 번호 [n]은 이 기업의 evidence 기준이며, competitor_analyst 가 공유 목록 번호로 바꿉니다."""
     item_name = state["item_name"]
     search_query = f"{competitor} {item_name}"
 
@@ -142,7 +168,7 @@ async def analyze_competitor(state: AgentState, competitor: str, feedback: str =
     # 점검용 테스트 모드: TRL과 근거 번호가 없는 "부실한 결과"를 만듭니다.
     if state.get("test_mode"):
         emit(Progress(node="competitor_analyst", message=f"[테스트 모드] {competitor} 부실한 분석 결과를 생성합니다."))
-        return {"competitor": competitor, "analysis": POOR_ANALYSIS_SAMPLE, "sources": sources}
+        return {"competitor": competitor, "analysis": POOR_ANALYSIS_SAMPLE, "sources": sources, "evidence": evidence}
 
     content = (
         f"분석 아이템: {item_name}\n분석 대상 기업: {competitor}\n\n"
@@ -161,6 +187,7 @@ async def analyze_competitor(state: AgentState, competitor: str, feedback: str =
         "competitor": competitor,
         "analysis": analysis,
         "sources": sources,
+        "evidence": evidence,
     }
 
 
@@ -178,15 +205,44 @@ async def run_branch(state: AgentState, competitor: str, feedback: str = "") -> 
 
 TRL_PATTERN = re.compile(r"TRL\s*추정\s*[:：]\s*(.*)")
 REASON_PATTERN = re.compile(r"(?:추정 근거|불확실한 점)\s*[:：]\s*(.*)")
+CITATION_PATTERN = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
 
 
-def check_finding(finding: dict) -> list[str]:
+def cited_numbers(text: str) -> list[int]:
+    """본문의 근거 번호 [n], [n, m] 을 모두 꺼냅니다."""
+    return [int(n) for group in CITATION_PATTERN.findall(text) for n in re.split(r"\s*,\s*", group)]
+
+
+def merge_branch_evidence(evidence: list[dict], finding: dict) -> None:
+    """기업 하나의 근거를 공유 근거 목록에 중복 없이 합치고, 분석의 [n]을 공유 목록 번호로 바꿉니다.
+    그 기업의 근거 범위를 벗어난 번호는 [?] 로 바꾸고 citation_error 에 남깁니다."""
+    index = {(e["source"], e["content"]): i for i, e in enumerate(evidence, start=1)}
+    local = finding.pop("evidence", [])
+    mapping = {}
+    for n, e in enumerate(local, start=1):
+        key = (e["source"], e["content"])
+        if key not in index:
+            evidence.append(e)
+            index[key] = len(evidence)
+        mapping[n] = index[key]
+
+    bad = sorted({n for n in cited_numbers(finding["analysis"]) if n not in mapping})
+    finding["citation_error"] = f"근거 번호 {bad} 범위 밖 (근거 {len(local)}건)" if bad else ""
+
+    def to_global(m: re.Match) -> str:
+        numbers = [mapping[int(n)] for n in re.split(r"\s*,\s*", m.group(1)) if int(n) in mapping]
+        return f"[{', '.join(map(str, numbers))}]" if numbers else "[?]"
+
+    finding["analysis"] = CITATION_PATTERN.sub(to_global, finding["analysis"])
+
+
+def check_finding(finding: dict, evidence_count: int) -> list[str]:
     """기업 하나의 분석 결과에서 부족한 점을 찾습니다. (없으면 빈 목록)"""
     analysis = finding.get("analysis", "")
     problems = []
     match = TRL_PATTERN.search(analysis)
     value = match.group(1).strip() if match else ""
-    citations = [int(n) for n in re.findall(r"\[(\d+)\]", analysis)]
+    citations = cited_numbers(analysis)
 
     if "판단 불가" in value:
         if not any(len(r.strip(" -.")) >= 2 for r in REASON_PATTERN.findall(analysis)):
@@ -197,20 +253,21 @@ def check_finding(finding: dict) -> list[str]:
     else:
         problems.append("TRL 누락")
 
-    limit = len(finding.get("sources", []))
-    out_of_range = sorted({n for n in citations if not 1 <= n <= limit})
+    if finding.get("citation_error"):
+        problems.append(finding["citation_error"])
+    out_of_range = sorted({n for n in citations if not 1 <= n <= evidence_count})
     if out_of_range:
-        problems.append(f"근거 번호 {out_of_range} 범위 밖 (근거 {limit}건)")
+        problems.append(f"근거 번호 {out_of_range} 범위 밖 (근거 {evidence_count}건)")
     return problems
 
 
-def check_analysis(competitors: list[str], findings: list[dict]) -> tuple[bool, str, dict[str, str]]:
+def check_analysis(competitors: list[str], findings: list[dict], evidence_count: int) -> tuple[bool, str, dict[str, str]]:
     """기업별 분석 단계 통과 기준: 설정 기업 수 = 결과 기업 수, 기업마다 check_finding 통과
     (통과 여부, 사유, {미통과 기업: 사유}) 를 돌려줍니다."""
     names = [f["competitor"] for f in findings]
     failed = {c: "분석 결과 누락" for c in competitors if c not in names}
     for f in findings:
-        problems = check_finding(f)
+        problems = check_finding(f, evidence_count)
         if problems:
             failed[f["competitor"]] = ", ".join(problems)
 
@@ -240,14 +297,22 @@ async def competitor_analyst(state: AgentState) -> dict:
 
     # Fan-out: 기업별 갈래를 동시에 실행 / Fan-in: 모든 기업의 결과를 기업 순서대로 모음
     results = await asyncio.gather(*(run_branch(state, c, feedback.get(c, "")) for c in targets))
+
+    # 기업별 근거를 공유 근거 목록에 합치고, 분석의 근거 번호를 공유 목록 번호로 바꿉니다.
+    evidence = list(state.get("evidence", []))
+    before = len(evidence)
+    for f in results:
+        merge_branch_evidence(evidence, f)
     merged = {**previous, **{f["competitor"]: f for f in results}}
     findings = [merged[c] for c in competitors if c in merged]
-    emit(Progress(node="competitor_analyst", message=f"기업별 분석 결과 {len(findings)}건 수집"))
+    emit(Progress(node="competitor_analyst",
+                  message=f"기업별 분석 결과 {len(findings)}건 수집, 기업별 근거 {len(evidence) - before}건을 근거 목록에 추가 (총 {len(evidence)}건)"))
 
-    passed, reason, failed = check_analysis(competitors, findings)
+    passed, reason, failed = check_analysis(competitors, findings, len(evidence))
     emit(Evaluation(stage="competitor_analyst", passed=passed, reason=reason, attempt=attempt))
 
     return {
+        "evidence": evidence,
         "competitor_findings": findings,
         "analysis_attempts": attempt,
         "analysis_passed": passed,
@@ -340,7 +405,6 @@ def budget_fallback_report(state: AgentState) -> str:
 MIN_RELEVANCE_SCORE = 4
 MIN_FAITHFULNESS = 0.8
 REPORT_ITEMS = ["Answer Relevance", "Faithfulness", "Citation Accuracy", "Completeness", "Uncertainty Disclosure"]
-CITATION_PATTERN = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
 NOT_JUDGED = "비용 상한으로 LLM Judge 미평가"
 
 
@@ -358,7 +422,7 @@ def split_sections(report: str) -> dict[str, str]:
 
 def check_citation_range(report: str, evidence_count: int) -> tuple[bool, str]:
     """Citation Accuracy 코드 부분: 인용 번호가 있고, 모든 [n]이 1 ~ 근거 수 범위 안"""
-    citations = [int(n) for group in CITATION_PATTERN.findall(report) for n in re.split(r"\s*,\s*", group)]
+    citations = cited_numbers(report)
     if not citations:
         return False, "근거 번호 [n] 없음"
     out_of_range = sorted({n for n in citations if not 1 <= n <= evidence_count})
@@ -440,8 +504,9 @@ def judge_items(result: dict | None) -> dict[str, tuple[bool, str]]:
         problems.append(f"번호 누락 {len(no_number)}건: {'; '.join(no_number[:3])}")
     if mismatch:
         problems.append(f"인용 근거가 뒷받침하지 않음 {len(mismatch)}건: {'; '.join(mismatch[:3])}")
-    items["Citation Accuracy"] = (bool(claims) and not problems,
-                                  " / ".join(problems) or f"주장 {len(claims)}건 모두 인용 근거가 뒷받침")
+    if not claims:
+        problems.append("판정한 사실 주장 없음")
+    items["Citation Accuracy"] = (not problems, " / ".join(problems) or f"주장 {len(claims)}건 모두 인용 근거가 뒷받침")
 
     uncertainty = result.get("uncertainty") or {}
     items["Uncertainty Disclosure"] = (uncertainty.get("passed") is True, str(uncertainty.get("reason", "")).strip())
@@ -473,6 +538,65 @@ def merge_items(code: dict[str, tuple[bool, str]], judge: dict[str, tuple[bool, 
     }
 
 
+def is_excluded_section(title: str) -> bool:
+    """주장 추출에서 빼는 절 (시사점·한계)"""
+    return "시사점" in title or "한계" in title
+
+
+def report_sentences(text: str) -> list[str]:
+    """보고서 텍스트를 비교용 문장으로 나눕니다. (목록·표 기호, 인용 번호, 공백 제거)"""
+    sentences = []
+    for line in text.splitlines():
+        line = re.sub(r"^[#\-*\s|]+", "", line)
+        for s in re.split(r"(?<=[.다])\s+", line):
+            s = re.sub(r"\[[\d,\s]+\]|\s", "", s)
+            if len(s) > 5:
+                sentences.append(s)
+    return sentences
+
+
+def drop_excluded_claims(result: dict | None, report: str) -> int:
+    """Judge가 시사점·한계 절에서 뽑은 주장을 claims에서 뺍니다. (프롬프트 지시와 관계없이 코드로 보장)
+    주장과 가장 비슷한 보고서 문장이 시사점·한계 절(또는 본문의 "불확실한 점" 줄)에 있으면 제외 대상으로 봅니다.
+    뺀 주장 수를 돌려줍니다."""
+    if not result or not isinstance(result.get("claims"), list):
+        return 0
+    main_lines, excluded_lines = [], []
+    for title, body in split_sections(report).items():
+        for line in body.splitlines():
+            if is_excluded_section(title) or "불확실한 점" in line:
+                excluded_lines.append(line)
+            else:
+                main_lines.append(line)
+    main = report_sentences("\n".join(main_lines))
+    excluded = report_sentences("\n".join(excluded_lines))
+    if not main or not excluded:
+        return 0
+
+    def best(claim: str, sentences: list[str]) -> float:
+        claim = re.sub(r"\[[\d,\s]+\]|\s", "", claim)
+        return max(SequenceMatcher(None, claim, s).ratio() for s in sentences)
+
+    kept = [c for c in result["claims"]
+            if not isinstance(c, dict) or best(str(c.get("claim", "")), excluded) <= best(str(c.get("claim", "")), main)]
+    dropped = len(result["claims"]) - len(kept)
+    result["claims"] = kept
+    return dropped
+
+
+def report_for_judge(report: str) -> str:
+    """보고서를 Judge 입력용으로 나눕니다. 시사점·한계 절은 주장 추출에서 빠지도록 따로 둡니다."""
+    sections = split_sections(report)
+    if not sections:
+        return f"보고서 본문 (주장 추출 대상):\n{report}"
+    main = [f"## {t}\n{b}" for t, b in sections.items() if not is_excluded_section(t)]
+    excluded = [f"## {t}\n{b}" for t, b in sections.items() if is_excluded_section(t)]
+    return (
+        f"보고서 본문 (주장 추출 대상):\n{''.join(main) or '(없음)'}\n\n"
+        f"시사점·한계 절 (주장 추출 제외, 불확실성 판정에 사용):\n{''.join(excluded) or '(없음)'}"
+    )
+
+
 async def evaluate_report(state: AgentState) -> tuple[dict[str, tuple[bool, str]], str]:
     """최종 보고서를 5개 항목으로 판정해 ({항목: (통과 여부, 사유)}, Judge 개선 요구) 를 돌려줍니다.
     Judge 호출이 비용 상한에 막히면 BudgetExceeded 를 그대로 올립니다."""
@@ -488,11 +612,14 @@ async def evaluate_report(state: AgentState) -> tuple[dict[str, tuple[bool, str]
             f"근거 자료:\n{format_evidence(state.get('evidence', []))}\n\n"
             f"경쟁사 분석 결과:\n{format_findings(state.get('competitor_findings', []))}\n\n"
             f"실행 중 확인된 한계:\n{chr(10).join(limits) or '(없음)'}\n\n"
-            f"평가할 보고서:\n{state.get('draft', '')}"
+            f"{report_for_judge(state.get('draft', ''))}"
         )),
     ]
     result = parse_json(await ainvoke_tracked(messages, node="step_evaluator"))
     feedback = str((result or {}).get("feedback", "")).strip()
+    dropped = drop_excluded_claims(result, state.get("draft", ""))
+    if dropped:
+        emit(Progress(node="step_evaluator", message=f"시사점·한계 절에서 뽑힌 주장 {dropped}건은 Faithfulness·Citation Accuracy 집계에서 제외"))
     return merge_items(code_items(state), judge_items(result)), feedback
 
 
