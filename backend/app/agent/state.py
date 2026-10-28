@@ -30,6 +30,10 @@ class AgentState(TypedDict, total=False):
     evidence_sufficient: bool           # 근거 수집 단계 평가 통과 여부 (check_research)
     evidence_note: str                  # 근거 수집 평가 사유 (다음 재검색 입력) / 근거 한계 (writer 에 전달)
     competitor_findings: list[dict]     # competitor_analyst 의 경쟁사별 분석 결과
+    analysis_attempts: int              # 기업별 분석 실행 횟수 (재분석 상한 판단용)
+    analysis_passed: bool               # 기업별 분석 단계 평가 통과 여부 (check_analysis)
+    analysis_reason: str                # 기업별 분석 평가 사유 / 분석 한계 (writer 에 전달)
+    analysis_feedback: dict             # 미통과 기업별 사유 (다음 재분석 입력)
     draft: str                          # writer 가 작성한 보고서 초안
 
     # ── 평가 ─────────────────────────────

@@ -14,7 +14,7 @@ Supervisor
   2. 근거가 없으면 researcher
   3. 근거 수집 평가(researcher 의 check_research)가 미통과면 재검색 (재검색 상한, 웹 검색 가능 여부 확인)
      / 더 할 수 없으면 한계를 남기고 진행
-  4. 경쟁사 비교 질문이면 competitor_analyst
+  4. 경쟁사 비교 질문이면 competitor_analyst / 기업별 분석 평가(check_analysis)가 미통과면 재분석 (재분석 상한)
   5. writer
   비용 상한에 도달하면 재검색·경쟁사 분석을 생략하고 writer 로 갑니다.
 """
@@ -83,6 +83,14 @@ def decide_next(state: AgentState, intent: str) -> tuple[str, str, dict]:
 def _after_research(state: AgentState, intent: str, update: dict) -> tuple[str, str, dict]:
     if intent == "compare" and "competitor_findings" not in state:
         return "competitor_analyst", "경쟁사 비교 질문이라 기업별 분석 필요", update
+    if intent == "compare" and not state.get("analysis_passed", True):
+        attempts = state.get("analysis_attempts", 0)
+        if attempts < settings.max_analysis_attempts:
+            return ("competitor_analyst",
+                    f"기업별 분석 평가 미통과로 재분석 ({attempts + 1}/{settings.max_analysis_attempts}회): {state.get('analysis_reason', '')}",
+                    update)
+        emit(Progress(node="supervisor", message=f"재분석 종료: 재분석 상한({settings.max_analysis_attempts}회) 후에도 기업별 분석 평가 미통과"))
+        return "writer", "기업별 분석 한계를 보고서에 명시하고 작성", update
     if intent == "compare":
         return "writer", "근거와 기업별 분석 결과 준비 완료", update
     return "writer", f"{INTENT_LABELS[intent]} 질문이라 경쟁사 분석 없이 작성", update

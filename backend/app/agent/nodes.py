@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -120,8 +121,16 @@ async def researcher(state: AgentState) -> dict:
 # competitor_analyst : 분석 대상 기업별 현황 분석
 #  - 기업마다 근거를 추가로 찾고, LLM으로 현황과 TRL을 추정합니다.
 #  - 기업 하나의 분석을 "갈래(branch)"라고 부르며, 갈래마다 시작/종료 이벤트를 남깁니다.
+#  - 기업별 분석 단계 평가(check_analysis) 결과를 evaluation 이벤트로 남기고 Supervisor 에 넘깁니다.
+#    미통과면 Supervisor 가 재분석하며, 미통과 기업만 그 사유를 입력에 넣어 다시 분석합니다.
 # ──────────────────────────────────────────────────────────────
-async def analyze_competitor(state: AgentState, competitor: str) -> dict:
+POOR_ANALYSIS_SAMPLE = (
+    "- 현황 요약: 해당 기업은 기술 개발을 활발히 진행하고 있으며 기술 수준이 높은 편입니다.\n"
+    "- 불확실한 점: 시장 상황에 따라 달라질 수 있습니다."
+)
+
+
+async def analyze_competitor(state: AgentState, competitor: str, feedback: str = "") -> dict:
     """기업 하나를 분석해 {"competitor": 기업명, "analysis": 분석 내용, "sources": [...]} 를 돌려줍니다."""
     item_name = state["item_name"]
     search_query = f"{competitor} {item_name}"
@@ -129,14 +138,21 @@ async def analyze_competitor(state: AgentState, competitor: str) -> dict:
     docs = await search_docs(state["item_id"], search_query, k=3)
     web = await search_web(search_query, max_results=2)
     evidence = docs + web
+    sources = [e["source"] for e in evidence]
 
-    messages = [
-        SystemMessage(content=COMPETITOR_ANALYST_SYSTEM),
-        HumanMessage(content=(
-            f"분석 아이템: {item_name}\n분석 대상 기업: {competitor}\n\n"
-            f"근거 자료:\n{format_evidence(evidence)}"
-        )),
-    ]
+    # 점검용 테스트 모드: TRL과 근거 번호가 없는 "부실한 결과"를 만듭니다.
+    if state.get("test_mode"):
+        emit(Progress(node="competitor_analyst", message=f"[테스트 모드] {competitor} 부실한 분석 결과를 생성합니다."))
+        return {"competitor": competitor, "analysis": POOR_ANALYSIS_SAMPLE, "sources": sources}
+
+    content = (
+        f"분석 아이템: {item_name}\n분석 대상 기업: {competitor}\n\n"
+        f"근거 자료:\n{format_evidence(evidence)}"
+    )
+    # 재분석: 직전 평가의 미통과 사유를 반영합니다.
+    if feedback:
+        content += f"\n\n이전 분석 평가 피드백 (반드시 반영):\n{feedback}"
+    messages = [SystemMessage(content=COMPETITOR_ANALYST_SYSTEM), HumanMessage(content=content)]
     try:
         analysis = await ainvoke_tracked(messages, node="competitor_analyst")
     except BudgetExceeded as e:
@@ -145,32 +161,100 @@ async def analyze_competitor(state: AgentState, competitor: str) -> dict:
     return {
         "competitor": competitor,
         "analysis": analysis,
-        "sources": [e["source"] for e in evidence],
+        "sources": sources,
     }
 
 
-async def run_branch(state: AgentState, competitor: str) -> dict:
+async def run_branch(state: AgentState, competitor: str, feedback: str = "") -> dict:
     """갈래 하나를 실행하고 시작/종료 이벤트와 소요 시간을 남깁니다."""
     emit(BranchStart(node="competitor_analyst", branch=competitor))
     started = time.perf_counter()
 
-    finding = await analyze_competitor(state, competitor)
+    finding = await analyze_competitor(state, competitor, feedback)
 
     elapsed = int((time.perf_counter() - started) * 1000)
     emit(BranchEnd(node="competitor_analyst", branch=competitor, duration_ms=elapsed))
     return finding
 
 
+TRL_PATTERN = re.compile(r"TRL\s*추정\s*[:：]\s*(.*)")
+REASON_PATTERN = re.compile(r"(?:추정 근거|불확실한 점)\s*[:：]\s*(.*)")
+
+
+def check_finding(finding: dict) -> list[str]:
+    """기업 하나의 분석 결과에서 부족한 점을 찾습니다. (없으면 빈 목록)"""
+    analysis = finding.get("analysis", "")
+    problems = []
+    match = TRL_PATTERN.search(analysis)
+    value = match.group(1).strip() if match else ""
+    citations = [int(n) for n in re.findall(r"\[(\d+)\]", analysis)]
+
+    if "판단 불가" in value:
+        if not any(len(r.strip(" -.")) >= 2 for r in REASON_PATTERN.findall(analysis)):
+            problems.append("TRL 판단 불가 이유 없음")
+    elif re.search(r"\b[1-9]\b", value):
+        if not citations:
+            problems.append("TRL 근거 번호 [n] 없음")
+    else:
+        problems.append("TRL 누락")
+
+    limit = len(finding.get("sources", []))
+    out_of_range = sorted({n for n in citations if not 1 <= n <= limit})
+    if out_of_range:
+        problems.append(f"근거 번호 {out_of_range} 범위 밖 (근거 {limit}건)")
+    return problems
+
+
+def check_analysis(competitors: list[str], findings: list[dict]) -> tuple[bool, str, dict[str, str]]:
+    """기업별 분석 단계 통과 기준: 설정 기업 수 = 결과 기업 수, 기업마다 check_finding 통과
+    (통과 여부, 사유, {미통과 기업: 사유}) 를 돌려줍니다."""
+    names = [f["competitor"] for f in findings]
+    failed = {c: "분석 결과 누락" for c in competitors if c not in names}
+    for f in findings:
+        problems = check_finding(f)
+        if problems:
+            failed[f["competitor"]] = ", ".join(problems)
+
+    problems = []
+    if len(names) != len(competitors) or set(names) != set(competitors):
+        problems.append(f"기업 수 불일치 (설정 {len(competitors)}개, 결과 {len(names)}개)")
+    problems += [f"{c} {r}" for c, r in failed.items()]
+    if problems:
+        return False, " / ".join(problems), failed
+    return True, f"{len(names)}개 기업 모두 TRL과 근거 번호 확인", {}
+
+
 @traced("competitor_analyst")
 async def competitor_analyst(state: AgentState) -> dict:
     competitors = state.get("competitors", [])
-    emit(Progress(node="competitor_analyst", message=f"분석 대상 {len(competitors)}개 기업: {', '.join(competitors)}"))
+    attempt = state.get("analysis_attempts", 0) + 1
+    previous = {f["competitor"]: f for f in state.get("competitor_findings", [])}
+    feedback = state.get("analysis_feedback", {}) if attempt > 1 else {}
+
+    # 재분석이면 미통과 기업만 다시 분석하고, 통과한 기업의 결과는 유지합니다.
+    targets = [c for c in competitors if c in feedback or c not in previous] if attempt > 1 else competitors
+    if attempt > 1:
+        emit(Progress(node="competitor_analyst", message=f"미통과 기업 재분석 (직전 평가 사유 반영): "
+                      + " / ".join(f"{c}: {feedback.get(c, '분석 결과 누락')}" for c in targets)))
+    else:
+        emit(Progress(node="competitor_analyst", message=f"분석 대상 {len(competitors)}개 기업: {', '.join(competitors)}"))
 
     # Fan-out: 기업별 갈래를 동시에 실행 / Fan-in: 모든 기업의 결과를 기업 순서대로 모음
-    findings = await asyncio.gather(*(run_branch(state, c) for c in competitors))
+    results = await asyncio.gather(*(run_branch(state, c, feedback.get(c, "")) for c in targets))
+    merged = {**previous, **{f["competitor"]: f for f in results}}
+    findings = [merged[c] for c in competitors if c in merged]
     emit(Progress(node="competitor_analyst", message=f"기업별 분석 결과 {len(findings)}건 수집"))
 
-    return {"competitor_findings": list(findings)}
+    passed, reason, failed = check_analysis(competitors, findings)
+    emit(Evaluation(stage="competitor_analyst", passed=passed, reason=reason, attempt=attempt))
+
+    return {
+        "competitor_findings": findings,
+        "analysis_attempts": attempt,
+        "analysis_passed": passed,
+        "analysis_reason": reason,
+        "analysis_feedback": failed,
+    }
 
 
 # ──────────────────────────────────────────────────────────────
@@ -206,6 +290,9 @@ async def writer(state: AgentState) -> dict:
     # 근거가 부족한 채로 진행하는 경우, 그 한계를 보고서에 밝히도록 전달합니다.
     if not state.get("evidence_sufficient", True) and state.get("evidence_note"):
         content += f"\n\n근거 한계 (보고서의 한계와 불확실성에 반드시 명시):\n{state['evidence_note']}"
+    # 기업별 분석이 평가를 통과하지 못한 채 진행하는 경우, 그 한계를 보고서에 밝히도록 전달합니다.
+    if not state.get("analysis_passed", True) and state.get("analysis_reason"):
+        content += f"\n\n기업별 분석 한계 (보고서의 한계와 불확실성에 반드시 명시):\n{state['analysis_reason']}"
     # 재작성: 이전 평가의 실패 사유와 개선 요구를 반영합니다.
     if state.get("status") == "eval_failed" and state.get("eval_reason"):
         emit(Progress(node="writer", message="이전 평가 피드백을 반영해 다시 작성합니다."))

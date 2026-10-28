@@ -26,6 +26,7 @@ class Settings:
     recursion_limit: int = int(os.getenv("RECURSION_LIMIT", "25"))
     max_eval_attempts: int = int(os.getenv("MAX_EVAL_ATTEMPTS", "3"))    # 보고서 평가 최대 횟수 (최초 작성 + 재작성)
     max_search_attempts: int = int(os.getenv("MAX_SEARCH_ATTEMPTS", "2"))  # 근거 검색 최대 횟수 (최초 검색 + 재검색)
+    max_analysis_attempts: int = int(os.getenv("MAX_ANALYSIS_ATTEMPTS", "2"))  # 기업별 분석 최대 횟수 (최초 분석 + 재분석)
     cost_limit_usd: float = float(os.getenv("COST_LIMIT_USD", "0.015"))     # 실행 1회의 LLM 비용 상한 (USD)
     frontend_origin: str = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
     poor_output_test: bool = os.getenv("POOR_OUTPUT_TEST", "0") == "1"   # 화면에서 모드를 보내지 않을 때의 기본값
