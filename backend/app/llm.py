@@ -56,7 +56,7 @@ def _emit_usage(node: str, message) -> float:
 #  - 예약 금액 = 입력 토큰 수 × 입력 단가 + 최대 출력 토큰 수 × 출력 단가
 #    (최대 출력 토큰 수를 호출에 함께 지정하므로 실제 비용은 예약 금액을 넘지 않습니다.)
 # ──────────────────────────────────────────────────────────────
-MAX_OUTPUT_TOKENS = {"writer": 2000}    # 노드별 최대 출력 토큰 수
+MAX_OUTPUT_TOKENS = {"writer": 2000, "step_evaluator": 1500}    # 노드별 최대 출력 토큰 수
 DEFAULT_MAX_OUTPUT_TOKENS = 600
 
 

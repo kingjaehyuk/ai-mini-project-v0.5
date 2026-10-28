@@ -9,7 +9,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import re
 import time
 
@@ -17,7 +16,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from app.agent.prompts import (
     COMPETITOR_ANALYST_SYSTEM,
-    EVALUATOR_SYSTEM,
+    REPORT_JUDGE_SYSTEM,
     SUFFICIENCY_SYSTEM,
     WRITER_SYSTEM,
     WRITER_SYSTEM_BY_INTENT,
@@ -327,32 +326,178 @@ def budget_fallback_report(state: AgentState) -> str:
 
 
 # ──────────────────────────────────────────────────────────────
-# step_evaluator : 보고서 평가
-#  - 분량을 먼저 확인하고, 질문 충족·근거 일치·근거 없는 추정을 LLM으로 평가합니다.
-#  - 통과하면 종료, 통과하지 못하면 피드백과 함께 writer 가 다시 작성합니다.
+# step_evaluator : 최종 보고서 평가
+#  - 5개 항목을 판정합니다. 모두 통과해야 보고서가 통과합니다.
+#      Answer Relevance        LLM Judge                 질문의 핵심 요구에 답함 (1~5점 중 4점 이상)
+#      Faithfulness            LLM Judge (+ 코드 비율)    근거로 뒷받침되는 주장 비율 ≥ 0.8
+#      Citation Accuracy       코드 (번호 범위) + LLM Judge (번호 누락 · 뒷받침 여부)
+#      Completeness            코드                      설정한 기업 수 = TRL과 근거가 있는 기업 수 (경쟁사 비교 질문)
+#      Uncertainty Disclosure  코드 (한계 절 유무) + LLM Judge (한계 서술, 근거 없는 TRL 단정 없음)
+#  - LLM Judge 는 평가 1회에 한 번 호출합니다. (REPORT_JUDGE_SYSTEM)
+#  - 항목마다 evaluation 이벤트(stage="final:<항목>")를 남기고, 미통과 항목의 사유를 writer 재작성에 전달합니다.
 #  - 평가 횟수가 상한(settings.max_eval_attempts)에 도달하면 실패 사유를 남기고 종료합니다.
 # ──────────────────────────────────────────────────────────────
-MIN_REPORT_CHARS = 300
+MIN_RELEVANCE_SCORE = 4
+MIN_FAITHFULNESS = 0.8
+REPORT_ITEMS = ["Answer Relevance", "Faithfulness", "Citation Accuracy", "Completeness", "Uncertainty Disclosure"]
+CITATION_PATTERN = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
+NOT_JUDGED = "비용 상한으로 LLM Judge 미평가"
 
 
-def parse_evaluation(text: str) -> tuple[bool, str]:
-    """평가 LLM 응답(JSON)을 (통과 여부, 사유+개선 요구)로 바꿉니다. 해석할 수 없으면 실패로 봅니다."""
-    raw = text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+def split_sections(report: str) -> dict[str, str]:
+    """보고서를 {## 제목: 본문} 으로 나눕니다."""
+    sections, title = {}, ""
+    for line in report.splitlines():
+        if line.startswith("## "):
+            title = line[3:].strip()
+            sections[title] = ""
+        elif title:
+            sections[title] += line + "\n"
+    return sections
+
+
+def check_citation_range(report: str, evidence_count: int) -> tuple[bool, str]:
+    """Citation Accuracy 코드 부분: 인용 번호가 있고, 모든 [n]이 1 ~ 근거 수 범위 안"""
+    citations = [int(n) for group in CITATION_PATTERN.findall(report) for n in re.split(r"\s*,\s*", group)]
+    if not citations:
+        return False, "근거 번호 [n] 없음"
+    out_of_range = sorted({n for n in citations if not 1 <= n <= evidence_count})
+    if out_of_range:
+        return False, f"근거 번호 {out_of_range} 범위 밖 (근거 {evidence_count}건)"
+    return True, f"인용 {len(citations)}개 모두 근거 범위(1~{evidence_count}) 안"
+
+
+def check_completeness(report: str, intent: str, competitors: list[str]) -> tuple[bool, str]:
+    """Completeness (코드): 설정한 기업 수 = TRL 추정과 근거 [n]이 있는 기업 수 ("판단 불가"는 근거 없이 인정)"""
+    if intent != "compare":
+        return True, "경쟁사 비교 질문이 아니라 기업별 TRL 해당 없음"
+    lines = report.splitlines()
+    has_trl_header = "TRL" in report
+    missing = []
+    for c in competitors:
+        ok = False
+        for i, line in enumerate(lines):
+            if c.lower() not in line.lower():
+                continue
+            # 표 형식이면 그 행만, 아니면 기업명이 나온 줄부터 3줄 아래까지를 그 기업의 서술로 봅니다.
+            # (다른 기업명이나 제목이 나오면 거기서 끊습니다.)
+            window_lines = [line]
+            if not line.lstrip().startswith("|"):
+                for nxt in lines[i + 1:i + 4]:
+                    if nxt.startswith("#") or any(o.lower() in nxt.lower() for o in competitors if o != c):
+                        break
+                    window_lines.append(nxt)
+            window = "\n".join(window_lines)
+            has_trl = "TRL" in window or (line.lstrip().startswith("|") and has_trl_header and re.search(r"\b[1-9]\b", line))
+            if "판단 불가" in window or (has_trl and CITATION_PATTERN.search(window)):
+                ok = True
+                break
+        if not ok:
+            missing.append(c)
+    if missing:
+        return False, f"TRL과 근거가 있는 기업 {len(competitors) - len(missing)}개 / 설정 {len(competitors)}개 (없음: {', '.join(missing)})"
+    return True, f"설정한 {len(competitors)}개 기업 모두 TRL과 근거 있음"
+
+
+def check_limitation_section(report: str) -> tuple[bool, str]:
+    """Uncertainty Disclosure 코드 부분: 한계 절이 있고 내용이 있음"""
+    body = next((b for t, b in split_sections(report).items() if "한계" in t), None)
+    if body is None:
+        return False, "한계 절 없음"
+    if not body.strip():
+        return False, "한계 절 내용 없음"
+    return True, "한계 절 있음"
+
+
+def judge_items(result: dict | None) -> dict[str, tuple[bool, str]]:
+    """LLM Judge 응답(JSON)을 항목별 판정으로 바꿉니다.
+    Answer Relevance, Faithfulness 는 최종 판정, Citation Accuracy, Uncertainty Disclosure 는 Judge 부분 판정입니다."""
+    if result is None:
+        reason = "Judge 응답을 해석하지 못함"
+        return {name: (False, reason) for name in ["Answer Relevance", "Faithfulness", "Citation Accuracy", "Uncertainty Disclosure"]}
+
+    relevance = result.get("answer_relevance") or {}
     try:
-        result = json.loads(raw)
-    except json.JSONDecodeError:
-        return False, "평가 결과를 해석하지 못했습니다. 근거 [n]를 붙여 질문에 직접 답하도록 다시 작성하세요."
-    passed = result.get("passed") is True
-    reason = str(result.get("reason", "")).strip()
-    feedback = str(result.get("feedback", "")).strip()
-    if not passed and feedback:
-        reason = f"{reason} / 개선 요구: {feedback}"
-    return passed, reason
+        score = int(relevance.get("score", 0))
+    except (TypeError, ValueError):
+        score = 0
+    items = {"Answer Relevance": (score >= MIN_RELEVANCE_SCORE,
+                                  f"{score}점 (기준 {MIN_RELEVANCE_SCORE}점): {relevance.get('reason', '')}")}
+
+    claims = [c for c in result.get("claims") or [] if isinstance(c, dict)]
+    supported = [c for c in claims if c.get("supported") is True]
+    ratio = len(supported) / len(claims) if claims else 0.0
+    unsupported = [str(c.get("claim", ""))[:40] for c in claims if c.get("supported") is not True]
+    reason = f"지지 비율 {ratio:.2f} ({len(supported)}/{len(claims)}, 기준 {MIN_FAITHFULNESS})"
+    if unsupported:
+        reason += f" / 근거 없는 주장 {len(unsupported)}건: {'; '.join(unsupported[:3])}"
+    items["Faithfulness"] = (bool(claims) and ratio >= MIN_FAITHFULNESS, reason)
+
+    no_number = [str(c.get("claim", ""))[:40] for c in claims if not c.get("citations")]
+    mismatch = [str(c.get("claim", ""))[:40] for c in claims if c.get("citations") and c.get("citation_ok") is not True]
+    problems = []
+    if no_number:
+        problems.append(f"번호 누락 {len(no_number)}건: {'; '.join(no_number[:3])}")
+    if mismatch:
+        problems.append(f"인용 근거가 뒷받침하지 않음 {len(mismatch)}건: {'; '.join(mismatch[:3])}")
+    items["Citation Accuracy"] = (bool(claims) and not problems,
+                                  " / ".join(problems) or f"주장 {len(claims)}건 모두 인용 근거가 뒷받침")
+
+    uncertainty = result.get("uncertainty") or {}
+    items["Uncertainty Disclosure"] = (uncertainty.get("passed") is True, str(uncertainty.get("reason", "")).strip())
+    return items
+
+
+def combine(code: tuple[bool, str], judge: tuple[bool, str]) -> tuple[bool, str]:
+    """코드 판정과 Judge 판정을 함께 써야 하는 항목: 둘 다 통과해야 통과"""
+    return code[0] and judge[0], f"코드: {code[1]} / Judge: {judge[1]}"
+
+
+def code_items(state: AgentState) -> dict[str, tuple[bool, str]]:
+    """코드로 판정하는 부분 (Citation Accuracy 번호 범위, Completeness, Uncertainty Disclosure 한계 절)"""
+    draft = state.get("draft", "")
+    return {
+        "Citation Accuracy": check_citation_range(draft, len(state.get("evidence", []))),
+        "Completeness": check_completeness(draft, state.get("intent", ""), state.get("competitors", [])),
+        "Uncertainty Disclosure": check_limitation_section(draft),
+    }
+
+
+def merge_items(code: dict[str, tuple[bool, str]], judge: dict[str, tuple[bool, str]]) -> dict[str, tuple[bool, str]]:
+    return {
+        "Answer Relevance": judge["Answer Relevance"],
+        "Faithfulness": judge["Faithfulness"],
+        "Citation Accuracy": combine(code["Citation Accuracy"], judge["Citation Accuracy"]),
+        "Completeness": code["Completeness"],
+        "Uncertainty Disclosure": combine(code["Uncertainty Disclosure"], judge["Uncertainty Disclosure"]),
+    }
+
+
+async def evaluate_report(state: AgentState) -> tuple[dict[str, tuple[bool, str]], str]:
+    """최종 보고서를 5개 항목으로 판정해 ({항목: (통과 여부, 사유)}, Judge 개선 요구) 를 돌려줍니다.
+    Judge 호출이 비용 상한에 막히면 BudgetExceeded 를 그대로 올립니다."""
+    limits = []
+    if not state.get("evidence_sufficient", True) and state.get("evidence_note"):
+        limits.append(f"근거 한계: {state['evidence_note']}")
+    if not state.get("analysis_passed", True) and state.get("analysis_reason"):
+        limits.append(f"기업별 분석 한계: {state['analysis_reason']}")
+    messages = [
+        SystemMessage(content=REPORT_JUDGE_SYSTEM),
+        HumanMessage(content=(
+            f"사용자 질문: {state['query']}\n질문 의도: {state.get('intent', '')}\n\n"
+            f"근거 자료:\n{format_evidence(state.get('evidence', []))}\n\n"
+            f"경쟁사 분석 결과:\n{format_findings(state.get('competitor_findings', []))}\n\n"
+            f"실행 중 확인된 한계:\n{chr(10).join(limits) or '(없음)'}\n\n"
+            f"평가할 보고서:\n{state.get('draft', '')}"
+        )),
+    ]
+    result = parse_json(await ainvoke_tracked(messages, node="step_evaluator"))
+    feedback = str((result or {}).get("feedback", "")).strip()
+    return merge_items(code_items(state), judge_items(result)), feedback
 
 
 @traced("step_evaluator")
 async def step_evaluator(state: AgentState) -> dict:
-    draft = state.get("draft", "")
     attempt = state.get("eval_attempts", 0) + 1
 
     # 비용 상한: 이미 상한에 도달했거나 평가 호출을 예약할 수 없으면 평가를 생략하고 현재 보고서로 종료합니다.
@@ -362,24 +507,27 @@ async def step_evaluator(state: AgentState) -> dict:
         emit(Progress(node="step_evaluator", message="[비용 상한] 평가를 생략하고 현재 보고서로 종료합니다."))
         return budget_end
 
-    if len(draft.strip()) < MIN_REPORT_CHARS:
-        passed, reason = False, f"보고서 분량 부족 ({len(draft.strip())}자) / 개선 요구: {MIN_REPORT_CHARS}자 이상으로 작성하세요."
-    else:
-        messages = [
-            SystemMessage(content=EVALUATOR_SYSTEM),
-            HumanMessage(content=(
-                f"사용자 질문: {state['query']}\n\n"
-                f"근거 자료:\n{format_evidence(state.get('evidence', []))}\n\n"
-                f"경쟁사 분석 결과:\n{format_findings(state.get('competitor_findings', []))}\n\n"
-                f"평가할 보고서:\n{draft}"
-            )),
-        ]
-        try:
-            passed, reason = parse_evaluation(await ainvoke_tracked(messages, node="step_evaluator"))
-        except BudgetExceeded as e:
-            emit(Progress(node="step_evaluator", message=f"[비용 상한] 평가를 생략하고 현재 보고서로 종료합니다: {e}"))
-            return budget_end
+    try:
+        items, feedback = await evaluate_report(state)
+    except BudgetExceeded as e:
+        # 코드 항목만 판정해 기록하고, Judge 항목은 미평가로 남긴 뒤 현재 보고서로 종료합니다.
+        emit(Progress(node="step_evaluator", message=f"[비용 상한] LLM Judge 평가를 생략하고 현재 보고서로 종료합니다: {e}"))
+        not_judged = {name: (False, NOT_JUDGED) for name in REPORT_ITEMS}
+        for name, (item_passed, item_reason) in merge_items(code_items(state), not_judged).items():
+            emit(Evaluation(stage=f"final:{name}", passed=item_passed, reason=item_reason, attempt=attempt))
+        return budget_end
 
+    for name, (item_passed, item_reason) in items.items():
+        emit(Evaluation(stage=f"final:{name}", passed=item_passed, reason=item_reason, attempt=attempt))
+
+    failed = [f"{name}: {r}" for name, (ok, r) in items.items() if not ok]
+    passed = not failed
+    if passed:
+        reason = "5개 항목 모두 통과"
+    else:
+        reason = f"미통과 {len(failed)}개 항목 - " + " / ".join(failed)
+        if feedback:
+            reason += f" / 개선 요구: {feedback}"
     emit(Evaluation(stage="report", passed=passed, reason=reason, attempt=attempt))
 
     if passed:
